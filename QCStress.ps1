@@ -5,7 +5,7 @@
 # and sleep/wake (modern standby) transitions.
 # ============================================================================
 param(
-    [ValidateSet("ppte", "usb", "hid", "sleep", "all", "scenario")]
+    [ValidateSet("ppte", "usb", "hid", "sleep", "all", "scenario", "usbreset", "cascade", "activeuse", "wudf")]
     [string]$Mode = "all",
 
     [int]$DurationMinutes = 30,
@@ -43,6 +43,10 @@ if ($ListScenarios) {
     Write-Host "    usb       USB selective suspend toggling only" -ForegroundColor Gray
     Write-Host "    hid       HID device disable/enable cycling only" -ForegroundColor Gray
     Write-Host "    sleep     Sleep/wake (modern standby) cycling only" -ForegroundColor Gray
+    Write-Host "    usbreset  USB composite device restart (ELAN re-enumeration)" -ForegroundColor Gray
+    Write-Host "    cascade   TP-first-then-KB cascading disable (mimics real failure)" -ForegroundColor Gray
+    Write-Host "    wudf      UMDF/WudfRd driver stack restart for ELAN devices" -ForegroundColor Gray
+    Write-Host "    activeuse Combined repro recipe: PPTE+USB+cascade+usbreset" -ForegroundColor Gray
     Write-Host "    scenario  Custom scenario string (see below)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  INTENSITY LEVELS (-Intensity):" -ForegroundColor Yellow
@@ -76,6 +80,21 @@ if ($ListScenarios) {
     Write-Host ""
     Write-Host "    # Default: just run everything for 30 min" -ForegroundColor DarkCyan
     Write-Host '    (no parameters needed)' -ForegroundColor White
+    Write-Host ""
+    Write-Host "    # Active-use repro: reproduces KB/TP loss during active use" -ForegroundColor DarkCyan
+    Write-Host '    -Mode activeuse -Intensity extreme -DurationMinutes 60' -ForegroundColor White
+    Write-Host ""
+    Write-Host "    # Cascade test: TP dies first then KB, 20 cycles" -ForegroundColor DarkCyan
+    Write-Host '    -Mode scenario -Scenario "cascade:20,ppte:200"' -ForegroundColor White
+    Write-Host ""
+    Write-Host "    # USB composite reset: force ELAN re-enumeration" -ForegroundColor DarkCyan
+    Write-Host '    -Mode usbreset -DurationMinutes 30' -ForegroundColor White
+    Write-Host ""
+    Write-Host "    # UMDF restart: cycle ELAN WudfRd driver stack" -ForegroundColor DarkCyan
+    Write-Host '    -Mode wudf -DurationMinutes 30' -ForegroundColor White
+    Write-Host ""
+    Write-Host "    # Full active-use gauntlet with sleep bursts" -ForegroundColor DarkCyan
+    Write-Host '    -Mode scenario -Scenario "ppte:500,usbreset:30,cascade:20,wudf:10,sleep:3" -Intensity extreme' -ForegroundColor White
     Write-Host ""
     Write-Host "  EXAMPLES:" -ForegroundColor Yellow
     Write-Host "    powershell -ExecutionPolicy Bypass -File QCStress.ps1" -ForegroundColor Gray
@@ -111,15 +130,19 @@ $settings = switch ($Intensity) {
 }
 
 # ---- Determine what to run ----
-$ppteOn  = $Mode -in @("ppte","all")
-$usbOn   = $Mode -in @("usb","all")
+$ppteOn  = $Mode -in @("ppte","all","activeuse")
+$usbOn   = $Mode -in @("usb","all","activeuse")
 $hidOn   = $Mode -in @("hid","all")
 $sleepOn = $Mode -eq "sleep" -or $SleepCycles -gt 0
+$usbResetOn = $Mode -in @("usbreset","activeuse")
+$cascadeOn  = $Mode -in @("cascade","activeuse")
+$wudfOn     = $Mode -in @("wudf","activeuse")
 
 # Parse scenario string
-$scenarioCounts = @{ ppte = 0; usb = 0; hid = 0; sleep = 0 }
+$scenarioCounts = @{ ppte = 0; usb = 0; hid = 0; sleep = 0; usbreset = 0; cascade = 0; wudf = 0 }
 if ($Mode -eq "scenario" -and $Scenario) {
     $ppteOn = $false; $usbOn = $false; $hidOn = $false; $sleepOn = $false
+    $usbResetOn = $false; $cascadeOn = $false; $wudfOn = $false
     foreach ($part in ($Scenario -split ',')) {
         $kv = $part.Trim() -split ':'
         if ($kv.Count -eq 2) {
@@ -129,10 +152,13 @@ if ($Mode -eq "scenario" -and $Scenario) {
                 $scenarioCounts[$key] = $val
                 if ($val -gt 0) {
                     switch ($key) {
-                        "ppte"  { $ppteOn = $true }
-                        "usb"   { $usbOn = $true }
-                        "hid"   { $hidOn = $true }
-                        "sleep" { $sleepOn = $true; $SleepCycles = $val }
+                        "ppte"     { $ppteOn = $true }
+                        "usb"      { $usbOn = $true }
+                        "hid"      { $hidOn = $true }
+                        "sleep"    { $sleepOn = $true; $SleepCycles = $val }
+                        "usbreset" { $usbResetOn = $true }
+                        "cascade"  { $cascadeOn = $true }
+                        "wudf"     { $wudfOn = $true }
                     }
                 }
             }
@@ -234,6 +260,49 @@ $usbControllers = Get-PnpDevice -Class USB -Status OK -ErrorAction SilentlyConti
 foreach ($d in $usbControllers) {
     Log "  [OK] $($d.FriendlyName)  InstanceId=$($d.InstanceId)" "OK"
 }
+
+# Discover ELAN USB composite parent devices (for usbreset/cascade/wudf modes)
+$script:elanUsbParents = @()
+$script:elanTpDevices = @()
+$script:elanKbDevices = @()
+Log ""
+Log "=== ELAN USB COMPOSITE PARENTS ===" "INFO"
+$allUsb = Get-PnpDevice -Class USB -ErrorAction SilentlyContinue |
+    Where-Object { $_.InstanceId -match 'VID_04F3' -and $_.InstanceId -notmatch 'MI_' -and $_.Status -eq 'OK' }
+foreach ($d in $allUsb) {
+    $script:elanUsbParents += $d
+    $tag = "USB-PARENT"
+    if ($d.InstanceId -match 'PID_0C9E') { $tag = "USB-PARENT(TP/HID)"; $script:elanTpDevices += $d }
+    if ($d.InstanceId -match 'PID_337A') { $tag = "USB-PARENT(KB)"; $script:elanKbDevices += $d }
+    Log "  [OK] [$tag] $($d.FriendlyName)  InstanceId=$($d.InstanceId)" "OK"
+}
+if ($script:elanUsbParents.Count -eq 0) {
+    # Fallback: look for any ELAN USB device including MI_ interfaces
+    $allElanUsb = Get-PnpDevice -Class USB -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VID_04F3' -and $_.Status -eq 'OK' }
+    foreach ($d in $allElanUsb) {
+        $script:elanUsbParents += $d
+        Log "  [OK] [FALLBACK] $($d.FriendlyName)  InstanceId=$($d.InstanceId)" "WARN"
+    }
+}
+# Also identify ELAN HID child devices for cascade mode
+$script:elanTpHid = @()
+$script:elanKbHid = @()
+$allHidDevs = Get-PnpDevice -Class HIDClass -ErrorAction SilentlyContinue
+foreach ($d in ($allHidDevs | Where-Object { $_.InstanceId -match 'VID_04F3&PID_0C9E' -and $_.Status -eq 'OK' })) {
+    $script:elanTpHid += $d
+}
+foreach ($d in ($allHidDevs | Where-Object { $_.InstanceId -match 'VID_04F3&PID_337A' -and $_.Status -eq 'OK' })) {
+    $script:elanKbHid += $d
+}
+# Also grab the Keyboard/Mouse class devices that map to ELAN
+foreach ($d in ($allKeyboards | Where-Object { $_.InstanceId -match 'VID_04F3&PID_337A' })) {
+    if ($d -notin $script:elanKbHid) { $script:elanKbHid += $d }
+}
+foreach ($d in ($allMice | Where-Object { $_.InstanceId -match 'VID_04F3' })) {
+    if ($d -notin $script:elanTpHid) { $script:elanTpHid += $d }
+}
+Log "  ELAN parents: $($script:elanUsbParents.Count)  TP-HID: $($script:elanTpHid.Count)  KB-HID: $($script:elanKbHid.Count)"
 
 # Sleep model
 Log ""
@@ -405,6 +474,225 @@ function Stress-SleepWake {
 }
 
 # ============================================================================
+# New Stress Functions (reverse-engineered from active-use KB/TP loss incident)
+# ============================================================================
+
+function Stress-USBReset {
+    # Restarts ELAN USB composite parent devices, forcing full HidUsb/WudfRd
+    # re-enumeration. This stresses the exact code path that takes 5-10s in the
+    # DriverWatchdog logs (USB\VID_04F3&PID_0C9E&MI_01 HidUsb device start).
+    param([int]$DelayMs)
+    $targets = $script:elanUsbParents
+    if (-not $targets -or $targets.Count -eq 0) {
+        Log "USB RESET: No ELAN USB parent devices found - skipping" "WARN"
+        LogCsv "USB_RESET" "NO_TARGETS" "SKIP"
+        return
+    }
+    foreach ($d in $targets) {
+        $id = $d.InstanceId
+        $short = $id.Substring(0, [Math]::Min($id.Length, 60))
+        Log "USB RESET: Restarting $($d.FriendlyName) ($short)" "WARN"
+
+        # Try pnputil /restart-device (available Win10 1903+)
+        $result = & pnputil /restart-device "$id" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            LogCsv "USB_RESET" "RESTART:$short" "OK"
+        } else {
+            # Fallback: disable then re-enable the composite parent
+            Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+            Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction SilentlyContinue
+            LogCsv "USB_RESET" "CYCLE:$short" "FALLBACK"
+        }
+    }
+
+    # Wait for re-enumeration (mirrors the 5-10s DriverWatchdog times)
+    Start-Sleep -Milliseconds ([Math]::Max(3000, $DelayMs))
+
+    # Verify
+    $kbOk = (Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+    $tpOk = (Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+    $kbTag = if ($kbOk) { "OK" } else { "DEAD" }
+    $tpTag = if ($tpOk) { "OK" } else { "DEAD" }
+    if ($kbOk -and $tpOk) {
+        LogCsv "USB_RESET" "VERIFY" "KB:OK TP:OK"
+    } else {
+        Log "USB RESET: POST-RESET FAILURE! KB:$kbTag TP:$tpTag" "ERROR"
+        LogCsv "USB_RESET" "VERIFY" "KB:$kbTag TP:$tpTag"
+    }
+}
+
+function Stress-Cascade {
+    # Simulates the exact failure pattern from the incident:
+    # 1. Touchpad/HID dies first (CM_PROB_DISABLED)
+    # 2. 2-5 seconds later, keyboard dies
+    # 3. Both re-enumerate and recover (or fail to recover)
+    # This mimics the ELAN USB HID stack instability where TP cursor
+    # disappears first, then keyboard follows seconds later.
+    param([int]$DelayMs, [int]$CycleNum = 0)
+
+    Log "CASCADE cycle $CycleNum - TP-first-then-KB pattern" "WARN"
+    LogCsv "CASCADE" "CYCLE:$CycleNum" "STARTING"
+
+    # Phase 1: Disrupt touchpad path
+    $tpTargets = $script:elanTpHid
+    if (-not $tpTargets -or $tpTargets.Count -eq 0) {
+        # Fallback: use ELAN USB TP parent
+        $tpTargets = $script:elanTpDevices
+    }
+    if (-not $tpTargets -or $tpTargets.Count -eq 0) {
+        Log "CASCADE: No ELAN TP targets found - trying generic Mouse class" "WARN"
+        $tpTargets = Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue |
+            Where-Object { $_.InstanceId -match 'HID' } | Select-Object -First 2
+    }
+
+    $tpDisabled = @()
+    foreach ($d in $tpTargets) {
+        try {
+            Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop
+            $tpDisabled += $d
+            Log "CASCADE: TP disabled - $($d.FriendlyName)" "WARN"
+            LogCsv "CASCADE" "TP_DISABLE:$($d.InstanceId.Substring(0, [Math]::Min($d.InstanceId.Length,50)))" "OK"
+        } catch {
+            Log "CASCADE: TP disable failed - $($d.FriendlyName): $($_.Exception.Message)" "ERROR"
+        }
+    }
+
+    # Stagger delay: 2-5 seconds (mimics the real gap between TP and KB loss)
+    $stagger = Get-Random -Minimum 2000 -Maximum 5000
+    Log "CASCADE: Staggering ${stagger}ms before KB disable..." "INFO"
+    Start-Sleep -Milliseconds $stagger
+
+    # Phase 2: Disrupt keyboard path
+    $kbTargets = $script:elanKbHid
+    if (-not $kbTargets -or $kbTargets.Count -eq 0) {
+        $kbTargets = Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue |
+            Where-Object { $_.InstanceId -match 'HID' } | Select-Object -First 2
+    }
+
+    $kbDisabled = @()
+    foreach ($d in $kbTargets) {
+        try {
+            Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction Stop
+            $kbDisabled += $d
+            Log "CASCADE: KB disabled - $($d.FriendlyName)" "WARN"
+            LogCsv "CASCADE" "KB_DISABLE:$($d.InstanceId.Substring(0, [Math]::Min($d.InstanceId.Length,50)))" "OK"
+        } catch {
+            Log "CASCADE: KB disable failed - $($d.FriendlyName): $($_.Exception.Message)" "ERROR"
+        }
+    }
+
+    # Hold both down for 3-8 seconds (mimics the 3-13s disruption window)
+    $holdDown = Get-Random -Minimum 3000 -Maximum 8000
+    Log "CASCADE: Both TP+KB disabled. Holding ${holdDown}ms..." "ERROR"
+    Start-Sleep -Milliseconds $holdDown
+
+    # Phase 3: Re-enable everything
+    foreach ($d in $tpDisabled) {
+        Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    foreach ($d in $kbDisabled) {
+        Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    LogCsv "CASCADE" "CYCLE:$CycleNum" "RE_ENABLED"
+
+    # Phase 4: Verify recovery (check repeatedly over 15s)
+    $recoveryStart = Get-Date
+    $recovered = $false
+    for ($w = 0; $w -lt 15; $w++) {
+        Start-Sleep -Milliseconds 1000
+        $kbOk = (Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+        $tpOk = (Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+        if ($kbOk -and $tpOk) {
+            $elapsed = [Math]::Round(((Get-Date) - $recoveryStart).TotalMilliseconds)
+            Log "CASCADE cycle $CycleNum - RECOVERED in ${elapsed}ms" "OK"
+            LogCsv "CASCADE" "CYCLE:$CycleNum RECOVERED:${elapsed}ms" "SELF_RECOVERED"
+            $script:hidRecoveries++
+            $recovered = $true
+            break
+        }
+    }
+    if (-not $recovered) {
+        $kbTag = if ((Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0) { "OK" } else { "DEAD" }
+        $tpTag = if ((Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0) { "OK" } else { "DEAD" }
+        Log "CASCADE cycle $CycleNum - FAILED TO RECOVER! KB:$kbTag TP:$tpTag" "ERROR"
+        LogCsv "CASCADE" "CYCLE:$CycleNum KB=$kbTag TP=$tpTag" "PERSISTENT_FAILURE"
+        $script:hidFailures++
+        # Force re-enable again
+        foreach ($d in ($tpDisabled + $kbDisabled)) {
+            Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
+
+    Start-Sleep -Milliseconds ([Math]::Max(2000, $DelayMs))
+}
+
+function Stress-WUDF {
+    # Restarts the UMDF (WudfRd) driver stack for ELAN devices.
+    # The incident logs show elanwbfusbdriver.dll crashing in WudfHost
+    # with access violation (c0000005). This forces the same teardown/restart
+    # path that happens during a real UMDF crash, stressing WudfRd recovery.
+    param([int]$DelayMs)
+
+    # Find ELAN devices serviced by WUDFRd
+    $wudfDevices = @()
+    $allDev = Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VID_04F3' -and $_.Status -eq 'OK' }
+    foreach ($d in $allDev) {
+        # Check if device uses WUDFRd driver
+        $drvInfo = Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_Service' -ErrorAction SilentlyContinue
+        if ($drvInfo -and $drvInfo.Data -match 'WUDFRd') {
+            $wudfDevices += $d
+        }
+    }
+
+    if ($wudfDevices.Count -eq 0) {
+        # Fallback: try the known ELAN USB composite parents
+        $wudfDevices = $script:elanUsbParents
+    }
+
+    if ($wudfDevices.Count -eq 0) {
+        Log "WUDF: No ELAN WUDFRd devices found - skipping" "WARN"
+        LogCsv "WUDF_RESTART" "NO_TARGETS" "SKIP"
+        return
+    }
+
+    foreach ($d in $wudfDevices) {
+        $id = $d.InstanceId
+        $short = $id.Substring(0, [Math]::Min($id.Length, 60))
+        Log "WUDF: Restarting driver stack for $($d.FriendlyName) ($short)" "WARN"
+
+        # Use pnputil to restart the device (triggers WudfRd teardown+restart)
+        $result = & pnputil /restart-device "$id" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            LogCsv "WUDF_RESTART" "RESTART:$short" "OK"
+        } else {
+            # Fallback: disable/enable cycle
+            Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 1000
+            Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction SilentlyContinue
+            LogCsv "WUDF_RESTART" "CYCLE:$short" "FALLBACK"
+        }
+    }
+
+    # Wait for WudfHost process restart and device re-initialization
+    Start-Sleep -Milliseconds ([Math]::Max(5000, $DelayMs))
+
+    # Verify
+    $kbOk = (Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+    $tpOk = (Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+    $kbTag = if ($kbOk) { "OK" } else { "DEAD" }
+    $tpTag = if ($tpOk) { "OK" } else { "DEAD" }
+    if ($kbOk -and $tpOk) {
+        Log "WUDF: Devices recovered after restart" "OK"
+        LogCsv "WUDF_RESTART" "VERIFY" "KB:OK TP:OK"
+    } else {
+        Log "WUDF: POST-RESTART FAILURE! KB:$kbTag TP:$tpTag" "ERROR"
+        LogCsv "WUDF_RESTART" "VERIFY" "KB:$kbTag TP:$tpTag"
+    }
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 Write-Host ""
@@ -417,6 +705,9 @@ if ($ppteOn) { $activeStressors += "PPTE" }
 if ($usbOn)  { $activeStressors += "USB" }
 if ($hidOn)  { $activeStressors += "HID" }
 if ($sleepOn) { $activeStressors += "Sleep($SleepCycles cycles)" }
+if ($usbResetOn) { $activeStressors += "USB-Reset" }
+if ($cascadeOn)  { $activeStressors += "Cascade(TP->KB)" }
+if ($wudfOn)     { $activeStressors += "WUDF-Restart" }
 
 Write-Host "  Active: $($activeStressors -join ' + ')" -ForegroundColor White
 Write-Host "  Intensity=$Intensity  Duration=${DurationMinutes}min" -ForegroundColor White
@@ -432,6 +723,7 @@ Log "================================================================"
 $startTime = Get-Date
 $endTime = $startTime.AddMinutes($DurationMinutes)
 $iter = 0; $pFlips = 0; $uToggles = 0; $hCycles = 0; $sCycles = 0
+$urCycles = 0; $cCycles = 0; $wCycles = 0
 $origScheme = Get-ActiveScheme
 
 # ---- Scenario mode: run specific counts ----
@@ -472,6 +764,33 @@ if ($Mode -eq "scenario" -and $Scenario) {
                 $sCycles++
             }
         }
+        if ($scenarioCounts.usbreset -gt 0) {
+            Log "Running $($scenarioCounts.usbreset) USB composite reset cycles..."
+            for ($i = 0; $i -lt $scenarioCounts.usbreset; $i++) {
+                Stress-USBReset -DelayMs $settings.HidDelayMs
+                $urCycles++
+                Write-Host "`r  USB-Reset: $($i+1)/$($scenarioCounts.usbreset)  " -NoNewline -ForegroundColor DarkGray
+            }
+            Write-Host ""
+        }
+        if ($scenarioCounts.cascade -gt 0) {
+            Log "Running $($scenarioCounts.cascade) cascade (TP->KB) cycles..."
+            for ($i = 0; $i -lt $scenarioCounts.cascade; $i++) {
+                Stress-Cascade -DelayMs $settings.HidDelayMs -CycleNum ($i + 1)
+                $cCycles++
+                Write-Host "`r  Cascade: $($i+1)/$($scenarioCounts.cascade)  " -NoNewline -ForegroundColor DarkGray
+            }
+            Write-Host ""
+        }
+        if ($scenarioCounts.wudf -gt 0) {
+            Log "Running $($scenarioCounts.wudf) WUDF driver restart cycles..."
+            for ($i = 0; $i -lt $scenarioCounts.wudf; $i++) {
+                Stress-WUDF -DelayMs $settings.HidDelayMs
+                $wCycles++
+                Write-Host "`r  WUDF: $($i+1)/$($scenarioCounts.wudf)  " -NoNewline -ForegroundColor DarkGray
+            }
+            Write-Host ""
+        }
     } finally {
         # Cleanup handled below in shared finally block
     }
@@ -491,11 +810,14 @@ if ($Mode -eq "scenario" -and $Scenario) {
         while ((Get-Date) -lt $endTime) {
             $iter++
             $e = [Math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-            Write-Host "`r  [${e}m/${DurationMinutes}m] iter=$iter ppte=$pFlips usb=$uToggles hid=$hCycles sleep=$sCycles  " -NoNewline -ForegroundColor DarkGray
+            Write-Host "`r  [${e}m/${DurationMinutes}m] iter=$iter ppte=$pFlips usb=$uToggles hid=$hCycles sleep=$sCycles ur=$urCycles casc=$cCycles wudf=$wCycles  " -NoNewline -ForegroundColor DarkGray
 
             if ($ppteOn) { Stress-PPTE -DelayMs $settings.PpteDelayMs; $pFlips++ }
             if ($usbOn -and ($iter % 5 -eq 0)) { Stress-USB -DelayMs $settings.UsbDelayMs; $uToggles++ }
             if ($hidOn -and ($iter % 20 -eq 0)) { Stress-HID -DelayMs $settings.HidDelayMs; $hCycles++ }
+            if ($usbResetOn -and ($iter % 15 -eq 0)) { Stress-USBReset -DelayMs $settings.HidDelayMs; $urCycles++ }
+            if ($cascadeOn -and ($iter % 25 -eq 0)) { Stress-Cascade -DelayMs $settings.HidDelayMs -CycleNum $cCycles; $cCycles++ }
+            if ($wudfOn -and ($iter % 30 -eq 0)) { Stress-WUDF -DelayMs $settings.HidDelayMs; $wCycles++ }
 
             # Interleave sleep cycles in "all" mode
             if ($sleepOn -and $Mode -eq "all" -and $SleepCycles -gt 0 -and $sCycles -lt $SleepCycles -and ($iter % 100 -eq 0)) {
@@ -513,7 +835,7 @@ if ($Mode -eq "scenario" -and $Scenario) {
 # ============================================================================
 Write-Host ""
 Log "================================================================"
-Log "Done. ppte=$pFlips usb=$uToggles hid=$hCycles sleep=$sCycles iters=$iter"
+Log "Done. ppte=$pFlips usb=$uToggles hid=$hCycles sleep=$sCycles usbreset=$urCycles cascade=$cCycles wudf=$wCycles iters=$iter"
 Log "  HID self-recoveries: $($script:hidRecoveries)" "OK"
 if ($script:hidFailures -gt 0) {
     Log "  HID PERSISTENT FAILURES: $($script:hidFailures)" "ERROR"
