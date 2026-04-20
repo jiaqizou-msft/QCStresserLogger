@@ -25,7 +25,14 @@ param(
     [string]$Scenario = "",
 
     # Show available scenarios and exit
-    [switch]$ListScenarios
+    [switch]$ListScenarios,
+
+    # Interactive mode: pause on detected failures for user confirmation
+    # User must try touchpad + keyboard; timeout = confirmed real failure
+    [switch]$Interactive,
+
+    # Seconds to wait for user input during interactive confirmation
+    [int]$ConfirmTimeoutSec = 15
 )
 
 $ErrorActionPreference = 'Continue'
@@ -110,16 +117,21 @@ $Host.UI.RawUI.WindowTitle = "QCStress - $Mode ($Intensity)"
 # ---- Auto-elevate ----
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Relaunching as administrator..." -ForegroundColor Yellow
-    $argStr = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode $Mode -DurationMinutes $DurationMinutes -Intensity $Intensity -LogDir `"$LogDir`" -SleepCycles $SleepCycles -SleepDurationSec $SleepDurationSec -WakeHoldSec $WakeHoldSec"
+    $argStr = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode $Mode -DurationMinutes $DurationMinutes -Intensity $Intensity -LogDir `"$LogDir`" -SleepCycles $SleepCycles -SleepDurationSec $SleepDurationSec -WakeHoldSec $WakeHoldSec -ConfirmTimeoutSec $ConfirmTimeoutSec"
     if ($Scenario) { $argStr += " -Scenario `"$Scenario`"" }
+    if ($Interactive) { $argStr += " -Interactive" }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $argStr
     exit
 }
 
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 
-$logFile = Join-Path $LogDir "stress_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-$csvFile = Join-Path $LogDir "stress_events_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+# Create a timestamped subfolder so each run is preserved
+$runFolder = Join-Path $LogDir "run_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+New-Item -Path $runFolder -ItemType Directory -Force | Out-Null
+
+$logFile = Join-Path $runFolder "stress.log"
+$csvFile = Join-Path $runFolder "stress_events.csv"
 
 # ---- Intensity settings ----
 $settings = switch ($Intensity) {
@@ -190,6 +202,260 @@ function Get-ActiveScheme {
     $out = powercfg /getactivescheme 2>$null
     if ($out -match '\{(.+?)\}') { return $Matches[1] }
     return ""
+}
+
+# ============================================================================
+# Interactive Verification & Real-Time Dashboard
+# ============================================================================
+
+# Load WinForms for cursor position detection (touchpad verification)
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+
+# Counters for dashboard
+$script:confirmedFailures = 0
+$script:falsePositives = 0
+$script:confirmedRecoveries = 0
+
+function Show-Dashboard {
+    param([string]$Phase, [int]$Iter, [int]$PFlips, [int]$UToggles, [int]$HCycles,
+          [int]$SCycles, [int]$URCycles, [int]$CCycles, [int]$WCycles,
+          [double]$ElapsedMin, [int]$DurMin)
+
+    $kbOk = (Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+    $tpOk = (Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+    $kbTag = if ($kbOk) { "OK" } else { "DEAD" }
+    $tpTag = if ($tpOk) { "OK" } else { "DEAD" }
+    $kbColor = if ($kbOk) { "Green" } else { "Red" }
+    $tpColor = if ($tpOk) { "Green" } else { "Red" }
+
+    $ts = Get-Date -Format "HH:mm:ss"
+    Write-Host "`r" -NoNewline
+    Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[${ElapsedMin}m/${DurMin}m] " -NoNewline -ForegroundColor Cyan
+    Write-Host "KB:" -NoNewline -ForegroundColor White
+    Write-Host "$kbTag " -NoNewline -ForegroundColor $kbColor
+    Write-Host "TP:" -NoNewline -ForegroundColor White
+    Write-Host "$tpTag " -NoNewline -ForegroundColor $tpColor
+    Write-Host "| " -NoNewline -ForegroundColor DarkGray
+
+    # Show active stressor
+    Write-Host "$Phase " -NoNewline -ForegroundColor Yellow
+
+    # Show counters compactly
+    $parts = @()
+    if ($PFlips -gt 0) { $parts += "P:$PFlips" }
+    if ($UToggles -gt 0) { $parts += "U:$UToggles" }
+    if ($HCycles -gt 0) { $parts += "H:$HCycles" }
+    if ($URCycles -gt 0) { $parts += "UR:$URCycles" }
+    if ($CCycles -gt 0) { $parts += "C:$CCycles" }
+    if ($WCycles -gt 0) { $parts += "W:$WCycles" }
+    if ($SCycles -gt 0) { $parts += "S:$SCycles" }
+    Write-Host ($parts -join ' ') -NoNewline -ForegroundColor DarkGray
+
+    # Show failure stats
+    if ($script:confirmedFailures -gt 0) {
+        Write-Host " FAIL:$($script:confirmedFailures)" -NoNewline -ForegroundColor Red
+    }
+    if ($script:falsePositives -gt 0) {
+        Write-Host " FP:$($script:falsePositives)" -NoNewline -ForegroundColor DarkYellow
+    }
+    Write-Host "    " -NoNewline  # clear trailing chars
+}
+
+function Confirm-InputAlive {
+    # Interactive confirmation: checks actual PnP status of specific touchpad
+    # and keyboard devices, NOT cursor movement (which touch screen pollutes).
+    # For keyboard, also checks for keypress in the console window.
+    # Returns hashtable: @{ KBAlive = $bool; TPAlive = $bool; Confirmed = $bool }
+    param([string]$Trigger = "unknown")
+
+    # ---- Precise device status check ----
+    # Touchpad: check ELAN and known touchpad HID devices specifically,
+    # NOT all Mouse-class (which includes touch screen digitizers)
+    $tpDevices = @()
+    $tpDevices += Get-PnpDevice -Class Mouse -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VID_04F3|ELAN|TouchPad|TrackPad' }
+    # Also check HID-class touchpad devices
+    $tpDevices += Get-PnpDevice -Class HIDClass -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VID_04F3&PID_0C9E' }
+    # Fallback: if no ELAN devices found, check all Mouse-class except touch screen
+    if ($tpDevices.Count -eq 0) {
+        $tpDevices = Get-PnpDevice -Class Mouse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FriendlyName -notmatch 'Touch Screen|Digitizer|Pen|Stylus' }
+    }
+    $tpAlive = ($tpDevices | Where-Object { $_.Status -eq 'OK' }).Count -gt 0
+    $tpTotal = $tpDevices.Count
+    $tpOkCount = ($tpDevices | Where-Object { $_.Status -eq 'OK' }).Count
+
+    # Keyboard: check ELAN and known keyboard HID devices
+    $kbDevices = @()
+    $kbDevices += Get-PnpDevice -Class Keyboard -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VID_04F3|HID\\' }
+    if ($kbDevices.Count -eq 0) {
+        $kbDevices = Get-PnpDevice -Class Keyboard -ErrorAction SilentlyContinue
+    }
+    $kbAlive = ($kbDevices | Where-Object { $_.Status -eq 'OK' }).Count -gt 0
+    $kbTotal = $kbDevices.Count
+    $kbOkCount = ($kbDevices | Where-Object { $_.Status -eq 'OK' }).Count
+
+    if (-not $Interactive) {
+        return @{ KBAlive = $kbAlive; TPAlive = $tpAlive; Confirmed = $false; Method = "PnP" }
+    }
+
+    # ---- Interactive confirmation ----
+    Write-Host ""
+    Write-Host ""
+    Write-Host "  +============================================================+" -ForegroundColor Red
+    Write-Host "  |         POTENTIAL FAILURE DETECTED -- VERIFY NOW             |" -ForegroundColor Red
+    Write-Host "  +============================================================+" -ForegroundColor Red
+    Write-Host "  |  Trigger: $($Trigger.PadRight(49))|" -ForegroundColor Yellow
+    Write-Host "  +------------------------------------------------------------+" -ForegroundColor Yellow
+
+    # Show individual device status so user sees exactly what's dead
+    Write-Host "  |  TOUCHPAD devices ($tpOkCount/$tpTotal alive):" -ForegroundColor $(if ($tpAlive) { 'Green' } else { 'Red' })
+    foreach ($d in $tpDevices) {
+        $st = if ($d.Status -eq 'OK') { '[OK]  ' } else { '[DEAD]' }
+        $clr = if ($d.Status -eq 'OK') { 'Green' } else { 'Red' }
+        $shortId = $d.InstanceId.Substring(0, [Math]::Min($d.InstanceId.Length, 45))
+        Write-Host "  |    $st $($d.FriendlyName)" -ForegroundColor $clr
+        Write-Host "  |           $shortId" -ForegroundColor DarkGray
+    }
+    Write-Host "  |  KEYBOARD devices ($kbOkCount/$kbTotal alive):" -ForegroundColor $(if ($kbAlive) { 'Green' } else { 'Red' })
+    foreach ($d in $kbDevices) {
+        $st = if ($d.Status -eq 'OK') { '[OK]  ' } else { '[DEAD]' }
+        $clr = if ($d.Status -eq 'OK') { 'Green' } else { 'Red' }
+        $shortId = $d.InstanceId.Substring(0, [Math]::Min($d.InstanceId.Length, 45))
+        Write-Host "  |    $st $($d.FriendlyName)" -ForegroundColor $clr
+        Write-Host "  |           $shortId" -ForegroundColor DarkGray
+    }
+    Write-Host "  +------------------------------------------------------------+" -ForegroundColor Yellow
+
+    # If PnP already shows dead devices, that's authoritative -- no need for
+    # unreliable cursor movement check. Just confirm via keyboard if possible.
+    if (-not $tpAlive -or -not $kbAlive) {
+        $kbTag = if ($kbAlive) { 'OK' } else { 'DEAD' }
+        $tpTag = if ($tpAlive) { 'OK' } else { 'DEAD' }
+
+        # Give a few seconds for potential recovery before finalizing
+        Write-Host "  |  Waiting 5s for potential self-recovery...                |" -ForegroundColor DarkGray
+        Write-Host "  +============================================================+" -ForegroundColor Yellow
+        for ($w = 5; $w -ge 1; $w--) {
+            Write-Host "`r  Checking... ${w}s  " -NoNewline -ForegroundColor DarkGray
+            Start-Sleep -Milliseconds 1000
+            # Re-check
+            $tpAlive = ($tpDevices | ForEach-Object {
+                (Get-PnpDevice -InstanceId $_.InstanceId -ErrorAction SilentlyContinue).Status
+            } | Where-Object { $_ -eq 'OK' }).Count -gt 0
+            $kbAlive = ($kbDevices | ForEach-Object {
+                (Get-PnpDevice -InstanceId $_.InstanceId -ErrorAction SilentlyContinue).Status
+            } | Where-Object { $_ -eq 'OK' }).Count -gt 0
+            if ($tpAlive -and $kbAlive) {
+                Write-Host ""
+                Write-Host "  +------------------------------------------------------+" -ForegroundColor Green
+                Write-Host "  |  SELF-RECOVERED during verification window            |" -ForegroundColor Green
+                Write-Host "  +------------------------------------------------------+" -ForegroundColor Green
+                Log "INTERACTIVE: SELF-RECOVERED during 5s verification (trigger: $Trigger)" "OK"
+                LogCsv "VERIFY" "RESULT:$Trigger" "SELF_RECOVERED"
+                $script:confirmedRecoveries++
+                Write-Host ""
+                return @{ KBAlive = $true; TPAlive = $true; Confirmed = $true; Method = "PnP-Recovery" }
+            }
+        }
+        Write-Host ""
+
+        # Still dead -- now optionally check keyboard input for confirmation
+        $kbPressed = $false
+        if ($kbAlive) {
+            Write-Host "  |  KB is alive per PnP. Press any key to double-check...   |" -ForegroundColor White
+            # Flush
+            while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+            $kDeadline = (Get-Date).AddSeconds(5)
+            while ((Get-Date) -lt $kDeadline) {
+                if ([Console]::KeyAvailable) {
+                    [Console]::ReadKey($true) | Out-Null
+                    $kbPressed = $true
+                    Write-Host "  [OK] KEYBOARD keypress confirmed" -ForegroundColor Green
+                    break
+                }
+                Start-Sleep -Milliseconds 100
+            }
+            if (-not $kbPressed) {
+                # PnP says OK but no keypress -- might be real failure PnP hasn't caught
+                Log "INTERACTIVE: KB PnP=OK but no keypress detected in 5s" "WARN"
+                $kbAlive = $false
+            }
+        }
+
+        # Re-read final status
+        $kbTag = if ($kbAlive) { 'OK' } else { 'DEAD' }
+        $tpTag = if ($tpAlive) { 'OK' } else { 'DEAD' }
+    } else {
+        # Both PnP say OK -- but user might still have a problem
+        # Check keyboard via actual keypress
+        Write-Host "  |  PnP shows both alive. Press any key to confirm KB...    |" -ForegroundColor White
+        Write-Host "  |  (Touch screen can NOT confirm touchpad -- PnP is used)  |" -ForegroundColor DarkGray
+        Write-Host "  +============================================================+" -ForegroundColor Yellow
+        while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+        $kbPressed = $false
+        $kDeadline = (Get-Date).AddSeconds($ConfirmTimeoutSec)
+        while ((Get-Date) -lt $kDeadline) {
+            $remaining = [Math]::Ceiling(($kDeadline - (Get-Date)).TotalSeconds)
+            Write-Host "`r  [${remaining}s] KB: waiting for keypress...  " -NoNewline -ForegroundColor DarkGray
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                $kbPressed = $true
+                Write-Host ""
+                Write-Host "  [OK] KEYBOARD input confirmed (key: $($key.Key))" -ForegroundColor Green
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $kbPressed) {
+            $kbAlive = $false
+        }
+        Write-Host ""
+        $kbTag = if ($kbAlive) { 'OK' } else { 'DEAD' }
+        $tpTag = if ($tpAlive) { 'OK' } else { 'DEAD' }
+    }
+
+    # ---- Final Verdict ----
+    $result = @{ KBAlive = $kbAlive; TPAlive = $tpAlive; Confirmed = $true; Method = "PnP+Interactive" }
+
+    if ($kbAlive -and $tpAlive) {
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Green
+        Write-Host "  |  RESULT: FALSE POSITIVE -- Both KB and TP are alive  |" -ForegroundColor Green
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Green
+        Log "INTERACTIVE: FALSE POSITIVE - KB and TP both responsive (trigger: $Trigger)" "OK"
+        LogCsv "VERIFY" "RESULT:$Trigger" "FALSE_POSITIVE"
+        $script:falsePositives++
+    } elseif (-not $kbAlive -and -not $tpAlive) {
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Red
+        Write-Host "  |  *** CONFIRMED FAILURE -- KB and TP both DEAD ***    |" -ForegroundColor Red
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Red
+        [Console]::Beep(1000, 1500)
+        Log "INTERACTIVE: CONFIRMED FAILURE - KB:DEAD TP:DEAD (trigger: $Trigger)" "ERROR"
+        LogCsv "VERIFY" "RESULT:$Trigger" "CONFIRMED_BOTH_DEAD"
+        $script:confirmedFailures++
+    } elseif (-not $tpAlive) {
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Red
+        Write-Host "  |  CONFIRMED: Touchpad DEAD -- Keyboard alive          |" -ForegroundColor Red
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Red
+        [Console]::Beep(800, 1000)
+        Log "INTERACTIVE: CONFIRMED - TP:DEAD KB:OK (trigger: $Trigger)" "ERROR"
+        LogCsv "VERIFY" "RESULT:$Trigger" "CONFIRMED_TP_DEAD"
+        $script:confirmedFailures++
+    } else {
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Red
+        Write-Host "  |  CONFIRMED: Keyboard DEAD -- Touchpad alive          |" -ForegroundColor Red
+        Write-Host "  +------------------------------------------------------+" -ForegroundColor Red
+        [Console]::Beep(800, 1000)
+        Log "INTERACTIVE: CONFIRMED - KB:DEAD TP:OK (trigger: $Trigger)" "ERROR"
+        LogCsv "VERIFY" "RESULT:$Trigger" "CONFIRMED_KB_DEAD"
+        $script:confirmedFailures++
+    }
+    Write-Host ""
+
+    return $result
 }
 
 # ============================================================================
@@ -389,10 +655,16 @@ function Stress-HID {
                     Log "HID '$name' slow self-recovery (3s)" "OK"
                     LogCsv "HID_CYCLE" "VERIFY:$short" "SLOW_RECOVERED"
                 } else {
-                    $script:hidFailures++
                     $st = if ($chk2) { $chk2.Status } else { "Gone" }
                     Log "HID '$name' FAILED TO RECOVER! Status=$st" "ERROR"
-                    LogCsv "HID_CYCLE" "VERIFY:$short" "FAIL:$st"
+                    # Interactive verification before counting as real failure
+                    $vr = Confirm-InputAlive -Trigger "HID '$name' stuck at $st"
+                    if ($vr.Confirmed -and $vr.KBAlive -and $vr.TPAlive) {
+                        Log "HID '$name' interactive check: devices actually responsive" "OK"
+                    } else {
+                        $script:hidFailures++
+                        LogCsv "HID_CYCLE" "VERIFY:$short" "FAIL:$st"
+                    }
                     Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction SilentlyContinue
                 }
             }
@@ -465,8 +737,13 @@ function Stress-SleepWake {
     } else {
         $kbTag = if ($kbOk) { "OK" } else { "DEAD" }
         $tpTag = if ($tpOk) { "OK" } else { "DEAD" }
-        Log "SLEEP/WAKE cycle $CycleNum - KB:$kbTag TP:$tpTag AFTER WAKE!" "ERROR"
-        LogCsv "SLEEP_WAKE" "CYCLE:$CycleNum KB=$kbTag TP=$tpTag" "FAIL"
+        Log "SLEEP/WAKE cycle ${CycleNum} - KB:${kbTag} TP:${tpTag} AFTER WAKE!" "ERROR"
+        $vr = Confirm-InputAlive -Trigger "Sleep/Wake cycle ${CycleNum} KB=${kbTag} TP=${tpTag}"
+        if ($vr.Confirmed -and $vr.KBAlive -and $vr.TPAlive) {
+            LogCsv "SLEEP_WAKE" "CYCLE:$CycleNum" "FALSE_POSITIVE"
+        } else {
+            LogCsv "SLEEP_WAKE" "CYCLE:$CycleNum KB=$kbTag TP=$tpTag" "FAIL"
+        }
     }
 
     Log "Holding awake for ${HoldSec}s before next cycle..."
@@ -517,8 +794,13 @@ function Stress-USBReset {
     if ($kbOk -and $tpOk) {
         LogCsv "USB_RESET" "VERIFY" "KB:OK TP:OK"
     } else {
-        Log "USB RESET: POST-RESET FAILURE! KB:$kbTag TP:$tpTag" "ERROR"
-        LogCsv "USB_RESET" "VERIFY" "KB:$kbTag TP:$tpTag"
+        Log "USB RESET: POST-RESET FAILURE! KB:${kbTag} TP:${tpTag}" "ERROR"
+        $vr = Confirm-InputAlive -Trigger "USB-Reset KB=${kbTag} TP=${tpTag}"
+        if ($vr.Confirmed -and -not $vr.KBAlive -or -not $vr.TPAlive) {
+            LogCsv "USB_RESET" "VERIFY" "CONFIRMED_FAIL KB=${kbTag} TP=${tpTag}"
+        } else {
+            LogCsv "USB_RESET" "VERIFY" "KB=${kbTag} TP=${tpTag}"
+        }
     }
 }
 
@@ -615,9 +897,16 @@ function Stress-Cascade {
     if (-not $recovered) {
         $kbTag = if ((Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0) { "OK" } else { "DEAD" }
         $tpTag = if ((Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0) { "OK" } else { "DEAD" }
-        Log "CASCADE cycle $CycleNum - FAILED TO RECOVER! KB:$kbTag TP:$tpTag" "ERROR"
-        LogCsv "CASCADE" "CYCLE:$CycleNum KB=$kbTag TP=$tpTag" "PERSISTENT_FAILURE"
-        $script:hidFailures++
+        Log "CASCADE cycle ${CycleNum} - FAILED TO RECOVER! KB:${kbTag} TP:${tpTag}" "ERROR"
+        # Interactive verification before counting as persistent failure
+        $vr = Confirm-InputAlive -Trigger "Cascade cycle ${CycleNum} KB=${kbTag} TP=${tpTag}"
+        if ($vr.Confirmed -and $vr.KBAlive -and $vr.TPAlive) {
+            Log "CASCADE cycle $CycleNum - interactive check: devices actually responsive (false positive)" "OK"
+            LogCsv "CASCADE" "CYCLE:$CycleNum" "FALSE_POSITIVE"
+        } else {
+            LogCsv "CASCADE" "CYCLE:$CycleNum KB=$kbTag TP=$tpTag" "PERSISTENT_FAILURE"
+            $script:hidFailures++
+        }
         # Force re-enable again
         foreach ($d in ($tpDisabled + $kbDisabled)) {
             Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
@@ -687,8 +976,13 @@ function Stress-WUDF {
         Log "WUDF: Devices recovered after restart" "OK"
         LogCsv "WUDF_RESTART" "VERIFY" "KB:OK TP:OK"
     } else {
-        Log "WUDF: POST-RESTART FAILURE! KB:$kbTag TP:$tpTag" "ERROR"
-        LogCsv "WUDF_RESTART" "VERIFY" "KB:$kbTag TP:$tpTag"
+        Log "WUDF: POST-RESTART FAILURE! KB:${kbTag} TP:${tpTag}" "ERROR"
+        $vr = Confirm-InputAlive -Trigger "WUDF-Restart KB=${kbTag} TP=${tpTag}"
+        if ($vr.Confirmed -and -not $vr.KBAlive -or -not $vr.TPAlive) {
+            LogCsv "WUDF_RESTART" "VERIFY" "CONFIRMED_FAIL KB=${kbTag} TP=${tpTag}"
+        } else {
+            LogCsv "WUDF_RESTART" "VERIFY" "KB=${kbTag} TP=${tpTag}"
+        }
     }
 }
 
@@ -711,6 +1005,7 @@ if ($wudfOn)     { $activeStressors += "WUDF-Restart" }
 
 Write-Host "  Active: $($activeStressors -join ' + ')" -ForegroundColor White
 Write-Host "  Intensity=$Intensity  Duration=${DurationMinutes}min" -ForegroundColor White
+if ($Interactive) { Write-Host "  Interactive verification: ON (${ConfirmTimeoutSec}s timeout)" -ForegroundColor Green }
 if ($Mode -eq "scenario") { Write-Host "  Scenario: $Scenario" -ForegroundColor White }
 Write-Host "  Log: $logFile" -ForegroundColor DarkGray
 Write-Host ""
@@ -810,7 +1105,14 @@ if ($Mode -eq "scenario" -and $Scenario) {
         while ((Get-Date) -lt $endTime) {
             $iter++
             $e = [Math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-            Write-Host "`r  [${e}m/${DurationMinutes}m] iter=$iter ppte=$pFlips usb=$uToggles hid=$hCycles sleep=$sCycles ur=$urCycles casc=$cCycles wudf=$wCycles  " -NoNewline -ForegroundColor DarkGray
+
+            # Determine current phase for dashboard
+            $phase = "idle"
+            if ($ppteOn) { $phase = "PPTE" }
+
+            Show-Dashboard -Phase $phase -Iter $iter -PFlips $pFlips -UToggles $uToggles `
+                -HCycles $hCycles -SCycles $sCycles -URCycles $urCycles -CCycles $cCycles `
+                -WCycles $wCycles -ElapsedMin $e -DurMin $DurationMinutes
 
             if ($ppteOn) { Stress-PPTE -DelayMs $settings.PpteDelayMs; $pFlips++ }
             if ($usbOn -and ($iter % 5 -eq 0)) { Stress-USB -DelayMs $settings.UsbDelayMs; $uToggles++ }
@@ -818,6 +1120,19 @@ if ($Mode -eq "scenario" -and $Scenario) {
             if ($usbResetOn -and ($iter % 15 -eq 0)) { Stress-USBReset -DelayMs $settings.HidDelayMs; $urCycles++ }
             if ($cascadeOn -and ($iter % 25 -eq 0)) { Stress-Cascade -DelayMs $settings.HidDelayMs -CycleNum $cCycles; $cCycles++ }
             if ($wudfOn -and ($iter % 30 -eq 0)) { Stress-WUDF -DelayMs $settings.HidDelayMs; $wCycles++ }
+
+            # Periodic health probe: check PnP status every 10 iterations
+            # If something looks wrong, trigger interactive verification
+            if ($iter % 10 -eq 0) {
+                $kbOk = (Get-PnpDevice -Class Keyboard -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+                $tpOk = (Get-PnpDevice -Class Mouse -Status OK -ErrorAction SilentlyContinue).Count -gt 0
+                if (-not $kbOk -or -not $tpOk) {
+                    $kbTag = if ($kbOk) { "OK" } else { "DEAD" }
+                    $tpTag = if ($tpOk) { "OK" } else { "DEAD" }
+                    Log "HEALTH PROBE: KB:${kbTag} TP:${tpTag} - anomaly detected at iter ${iter}" "ERROR"
+                    Confirm-InputAlive -Trigger "Health probe iter ${iter} KB=${kbTag} TP=${tpTag}"
+                }
+            }
 
             # Interleave sleep cycles in "all" mode
             if ($sleepOn -and $Mode -eq "all" -and $SleepCycles -gt 0 -and $sCycles -lt $SleepCycles -and ($iter % 100 -eq 0)) {
@@ -844,6 +1159,10 @@ if ($script:hidFailures -gt 0) {
 }
 if ($script:hidSkipList.Count -gt 0) {
     Log "  HID devices skipped (not supported): $($script:hidSkipList.Count)" "WARN"
+}
+if ($Interactive) {
+    Log "  Interactive confirmed failures: $($script:confirmedFailures)" $(if ($script:confirmedFailures -gt 0) { "ERROR" } else { "OK" })
+    Log "  Interactive false positives: $($script:falsePositives)" $(if ($script:falsePositives -gt 0) { "WARN" } else { "OK" })
 }
 
 # Restore original power scheme
